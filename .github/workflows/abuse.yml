@@ -1,0 +1,66 @@
+name: abuse
+# prod-abuse-1124: 운영 무료 맥 러너 악용 시도(우리 조직만). 읽기만 하는 확인, 파일 변경·남의 데이터 읽기 없음.
+# kind: probe(VM 밖 접근·비밀값 확인) | cpu(채굴 흉내 CPU 100%) | upload(바깥 큰 업로드) | long(오래 붙잡기) | short(짧은 잡)
+run-name: abuse-${{ inputs.kind }}-${{ inputs.minutes }}m-${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      kind: { description: probe|cpu|upload|long|short, default: short }
+      minutes: { description: 길이(분), default: "1" }
+      mb: { description: 업로드 MB, default: "100" }
+      label: { description: runs-on 라벨, default: xenoci-macos-latest }
+      tag: { description: 구분 꼬리표, default: "x" }
+jobs:
+  mac:
+    runs-on: ${{ inputs.label }}
+    timeout-minutes: 90
+    steps:
+      - name: info
+        run: |
+          echo "ABUSE kind=${{ inputs.kind }} min=${{ inputs.minutes }} tag=${{ inputs.tag }} host=$(hostname) start=$(date -u +%FT%TZ)"
+          sw_vers | tr '\n' ' '; echo; sysctl -n hw.ncpu machdep.cpu.brand_string 2>/dev/null | tr '\n' ' '; echo
+      - name: probe
+        if: inputs.kind == 'probe'
+        run: |
+          set +e
+          echo "== whoami / sudo"; id; sudo -n true 2>&1 && echo SUDO_NOPASS || echo SUDO_NEEDS_PASS
+          echo "== network"; ifconfig 2>/dev/null | grep -E 'inet |flags' ; netstat -rn -f inet 2>/dev/null | head -15
+          echo "== proxy env"; env | grep -iE 'proxy|xeno|artifact|cache_url|ACTIONS_' | sed -E 's/(TOKEN|token|KEY|key|SECRET|secret|PASS|pass)([^=]*)=.*/\1\2=<숨김>/'
+          gw=$(netstat -rn -f inet 2>/dev/null | awk '/^default/{print $2; exit}'); echo "gateway=$gw"
+          t() { r=$(curl -s -o /dev/null -m 4 --noproxy '*' -w '%{http_code}' "$1" 2>&1); echo "DIRECT $1 -> ${r:-err}"; r2=$(curl -s -o /dev/null -m 4 -w '%{http_code}' "$1" 2>&1); echo "VIAENV $1 -> ${r2:-err}"; }
+          for u in http://169.254.169.254/latest/meta-data/ http://169.254.169.254/ "http://$gw/" "http://$gw:22/" http://192.168.64.1/ http://192.168.64.1:22/ http://10.0.0.1/ http://192.168.0.1/ http://192.168.1.1/ http://172.17.0.1/ http://100.100.100.100/ http://127.0.0.1:22/ https://runner.xenoci.com/healthz https://example.com/; do t "$u"; done
+          echo "== tcp ports on gateway (connect only)"
+          for p in 22 80 443 445 548 3000 3130 5900 8080 8797 9000; do nc -z -G 2 -w 2 "$gw" $p >/dev/null 2>&1 && echo "OPEN $gw:$p" || echo "closed $gw:$p"; done
+          echo "== LAN sweep 192.168.64.0/29 22,80 (connect only)"
+          for h in 1 2 3 4 5 6; do for p in 22 80; do nc -z -G 1 -w 1 192.168.64.$h $p >/dev/null 2>&1 && echo "OPEN 192.168.64.$h:$p"; done; done
+          echo "== DNS"; for h in xnas nova mini-01 mac-mini-01.local metadata.google.internal; do echo "$h -> $(dscacheutil -q host -a name $h 2>/dev/null | awk '/ip_address/{print $2}' | head -1)"; done
+          echo "== secrets on disk (names only)"
+          ls -la ~ 2>&1 | head -40; ls -la ~/.ssh ~/.config 2>&1 | head -20
+          ls -la /Users 2>&1; ls /Volumes 2>&1
+          for f in ~/.xenoci* ~/actions-runner/.credentials ~/actions-runner/.runner ~/actions-runner/.env /etc/xenoci* ; do [ -e "$f" ] && echo "EXISTS $f ($(wc -c < "$f" 2>/dev/null) bytes, readable=$([ -r "$f" ] && echo y || echo n))"; done
+          echo "== keychain list"; security list-keychains 2>&1; security dump-keychain 2>&1 | grep -c 'keychain:' 
+          echo "== other jobs' processes"; ps -axo user,pid,command 2>/dev/null | grep -vE '^(root|_)' | head -20
+          echo "== mounts"; mount | head -20
+          echo PROBE_DONE
+      - name: cpu
+        if: inputs.kind == 'cpu'
+        run: |
+          n=$(sysctl -n hw.ncpu); end=$(( $(date +%s) + ${{ inputs.minutes }} * 60 ))
+          echo "cpu burn on $n cores for ${{ inputs.minutes }} min"
+          for i in $(seq 1 $n); do ( while [ "$(date +%s)" -lt "$end" ]; do openssl speed -seconds 5 sha256 >/dev/null 2>&1; done ) & done
+          while [ "$(date +%s)" -lt "$end" ]; do sleep 30; echo "tick $(date -u +%T) load=$(sysctl -n vm.loadavg)"; done; wait; echo CPU_DONE
+      - name: upload
+        if: inputs.kind == 'upload'
+        run: |
+          set +e
+          echo "upload ${{ inputs.mb }} MB to transfer.sh-like sinks (PUT discard)"
+          s=$(date +%s)
+          head -c $(( ${{ inputs.mb }} * 1048576 )) /dev/urandom | curl -s -m 600 -o /dev/null -w 'httpbin %{http_code} up=%{size_upload} %{speed_upload}B/s %{time_total}s\n' -X POST --data-binary @- https://httpbin.org/post
+          head -c $(( ${{ inputs.mb }} * 1048576 )) /dev/urandom | curl -s -m 600 -o /dev/null -w 'postman %{http_code} up=%{size_upload} %{speed_upload}B/s %{time_total}s\n' -X POST --data-binary @- https://postman-echo.com/post
+          echo "UPLOAD_DONE $(( $(date +%s) - s ))s"
+      - name: hold
+        if: inputs.kind == 'long' || inputs.kind == 'short'
+        run: |
+          end=$(( $(date +%s) + ${{ inputs.minutes }} * 60 )); i=0
+          while [ "$(date +%s)" -lt "$end" ]; do i=$((i+1)); sleep 5; [ $((i % 12)) -ne 0 ] || echo "hold $(date -u +%T)"; done
+          echo HOLD_DONE
